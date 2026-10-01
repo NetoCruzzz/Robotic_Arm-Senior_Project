@@ -20,25 +20,36 @@ struct Calibration {
     Calibration(int l = 0, int h = 0, int u = 0) : low(l), home(h), high(u) {}
 };
 // Channel map: 0 Claw, 1 Wrist Rot, 2 Wrist.
-constexpr int JOINT_COUNT = 6;
-const char *JOINT_NAMES[] = {"Claw", "Wrist Rot", "Wrist", "Elbow", "Shoulder", "Base"};                // These names are used in the serial command interface.
+constexpr int JOINT_COUNT = 5;
+const char *JOINT_NAMES[] = {"Claw", "Wrist Rot", "Wrist", "Elbow", "Shoulder"};                // These names are used in the serial command interface.
 // User-supplied limits; these do not detect collisions between joints.
 const Calibration DEFAULTS[JOINT_COUNT] = {                                                             // These are the default calibration values for each joint, specified in microseconds. Each joint has a min, home, and max value that defines its range of motion.
-    {1100,1800,3000}, {1000,1800,2600}, {1000,1750,2500},
-    {1000,1800,2600}, {1000,1800,2600}, {500,1800,2600}
+    {1100,1800,2600}, {1000,1800,2600}, {1000,1750,2500},
+    {1000,1800,2600}, {350,1800,2450}
 };
-Calibration joints[JOINT_COUNT];                                                                        // Creates an array of 6 calibration slots — one for each joint — to store min, home, and max limits while the program runs.
+Calibration joints[JOINT_COUNT];                                                                        // Creates an array of 5 calibration slots — one for each joint — to store min, home, and max limits while the program runs.
 int commanded[JOINT_COUNT] = {};                                                                        // This array holds the last commanded pulse width for each joint, allowing the program to track the current position of each joint in microseconds.
 bool enabled[JOINT_COUNT] = {};                                                                         // This array tracks whether each joint is currently enabled or disabled. When a joint = true, it can receive commands to move; when false, it will not respond to movement commands.
 
-// Wave tuning: pulse offsets, NOT angles.
+// Pose values are pulse widths in microseconds, indexed by PCA9685 channel.
+// Keep the configured channel count until CH5 calibration is confirmed.
+struct ArmPose { int servo[JOINT_COUNT]; };
+ArmPose poseStart = {}, poseTarget = {};
+bool poseMoving = false;
+uint32_t poseStarted = 0, poseLastFrame = 0, poseDuration = 0;
+constexpr uint32_t POSE_MIN_MS = 1000;
+constexpr uint32_t POSE_PEAK_US_PER_SECOND = 100;
+
+// Wave targets use the active calibration, in microseconds, NOT angles.
 // Move shoulder -> elbow -> wrist -> wrist rotation, then repeat once.
 constexpr int WAVE_CHANNELS[] = {4, 3, 2, 1};
-constexpr int WAVE_OFFSET_US[] = {-175, 175, 175, 175};                                                 // If home position is 1800 and we input 75 = 1800 -> 1875 -> 1800. It will move one direction if negative number then it will move opposite direction.
-constexpr uint32_t WAVE_LEG_MS = 1000; // Time for outward OR return leg.
+constexpr int WAVE_JOINT_COUNT = sizeof(WAVE_CHANNELS) / sizeof(WAVE_CHANNELS[0]);
+constexpr int WAVE_LEGS_PER_JOINT = 4; // Current -> home -> min -> max -> home.
+constexpr uint32_t WAVE_MIN_LEG_MS = 1000;
+constexpr uint32_t WAVE_US_PER_SECOND = 175; // Average pulse change; eased peak is 1.5x.
 constexpr int WAVE_PASSES = 2;
 bool waving = false;
-int waveOrigin[4], waveOuter[4];
+int waveTargets[WAVE_JOINT_COUNT][WAVE_LEGS_PER_JOINT + 1];
 int waveLeg = 0;
 uint32_t waveLegStarted = 0, waveLastFrame = 0;
 // No position feedback: a reset or loss of servo power invalidates physical position.
@@ -53,9 +64,9 @@ size_t used = 0;
 bool overflow = false;
 
 // Pulse widths in microseconds; these are exploration bounds, not measured travel limits.
-int explorationMin(int ch) { return ch == 5 ? 500 : EXPLORATION_MIN_US; }
+int explorationMin(int ch) { return ch == 4 ? 350 : EXPLORATION_MIN_US; }
 
-int explorationMax(int ch) { return ch == 0 ? 3000 : EXPLORATION_MAX_US; }
+int explorationMax(int ch) { return ch == 4 ? 2450 : EXPLORATION_MAX_US; }
 
 void keyFor(char *key, int ch, char field) { snprintf(key, 12, "c%d%c", ch, field); }
 
@@ -70,14 +81,17 @@ void help()
 {
     Serial.println("Send one command per line (Enter):");
     Serial.println("diag       read PCA9685 configuration and selected channel registers");
-    Serial.println("ch 0..5    select joint; other joints KEEP HOLDING");
+    Serial.println("ch 0..4    select joint; other joints KEEP HOLDING");
     Serial.println("arm <us>   enable at a known clear pulse");
     Serial.println("+ / -      ONE 5 us step; no automatic sweep");
     Serial.println("min / max / markhome   record current pulse (home is a legacy alias)");
     Serial.println("armhome    enable all at home ONLY when physically supported in that pose");
+    Serial.println("homeplan   preview active HOME values; no movement");
+    Serial.println("H          slowly move enabled joints together to HOME");
+    Serial.println("pose       print current commands for physical pose testing");
     Serial.println("waveplan   preview CH4->3->2->1 wave targets; no movement");
-    Serial.println("wave       two gentle passes from current positions, then return");
-    Serial.println("stop       cancel wave; hold last commanded positions");
+    Serial.println("wave       two passes: each CH4..1 goes home -> min -> max -> home");
+    Serial.println("stop       cancel motion; hold last commanded positions");
     Serial.println("offall or !  disable ALL pulses; ! works immediately without Enter");
     Serial.println("save       persist selected channel's complete limits to ESP32 flash");
     Serial.println("list       print all recorded values; ? = help");
@@ -156,6 +170,7 @@ bool writeVerifiedPulse(int microseconds)
 void reportOutputFault()
 {
     waving = false;
+    poseMoving = false;
     ready = false;
     Serial.println("Output state uncertain; further jogs blocked. Turn servo power off, capture diag, then reset.");
 }
@@ -164,6 +179,7 @@ void reportOutputFault()
 void disableAll()
 {
     waving = false;
+    poseMoving = false;
     bool ok = true;
     for (int i = 0; i < 16; ++i) {
         if (pwm.setPWM(i, 0, 4096) != 0) ok = false;
@@ -175,6 +191,7 @@ void disableAll()
 // Use the existing verified writer for a particular channel without changing selection.
 bool writeJoint(int ch, int value)
 {
+    if (ch < 0 || ch >= JOINT_COUNT) return false;
     int selected = channel;
     channel = ch;
     bool ok = allowed(value) && writeVerifiedPulse(value);
@@ -183,28 +200,175 @@ bool writeJoint(int ch, int value)
     commanded[ch] = value;
     return true;
 }
+
+ArmPose homePose()
+{
+    ArmPose home = {};
+    for (int ch = 0; ch < JOINT_COUNT; ++ch) home.servo[ch] = joints[ch].home;
+    return home;
+}
+
+void printPose()
+{
+    Serial.println("Commanded pulses only; physical position is NOT measured.");
+    for (int ch = 0; ch < JOINT_COUNT; ++ch)
+        Serial.printf("CH%d %s: %d us (%s)\n", ch, JOINT_NAMES[ch],
+                      commanded[ch], enabled[ch] ? "enabled" : "disabled/stale");
+}
+
+bool validatePose(const ArmPose &target)
+{
+    for (int ch = 0; ch < JOINT_COUNT; ++ch) {
+        const Calibration &c = joints[ch];
+        if (c.low < explorationMin(ch) || c.high > explorationMax(ch) ||
+            c.low >= c.high || c.home < c.low || c.home > c.high ||
+            target.servo[ch] < c.low || target.servo[ch] > c.high) {
+            Serial.printf("Pose blocked: invalid calibration or target for CH%d.\n", ch);
+            return false;
+        }
+    }
+    return true;
+}
+
+uint32_t coordinatedDuration(const ArmPose &from, const ArmPose &to)
+{
+    uint32_t largest = 0;
+    for (int ch = 0; ch < JOINT_COUNT; ++ch) {
+        uint32_t distance = abs(to.servo[ch] - from.servo[ch]);
+        if (distance > largest) largest = distance;
+    }
+    // Smoothstep's peak slope is 1.5: cap the planned peak pulse rate.
+    uint32_t duration = (largest * 1500UL + POSE_PEAK_US_PER_SECOND - 1) /
+                        POSE_PEAK_US_PER_SECOND;
+    return duration < POSE_MIN_MS ? POSE_MIN_MS : duration;
+}
+
+void previewHome()
+{
+    ArmPose home = homePose();
+    Serial.printf("HOME preview: %d configured joints; no movement.\n", JOINT_COUNT);
+    for (int ch = 0; ch < JOINT_COUNT; ++ch)
+        Serial.printf("CH%d %s: min %d, HOME %d, max %d us; command %d (%s)\n",
+                      ch, JOINT_NAMES[ch], joints[ch].low, home.servo[ch],
+                      joints[ch].high, commanded[ch], enabled[ch] ? "enabled" : "disabled");
+    if (!validatePose(home)) return;
+    ArmPose current = {};
+    for (int ch = 0; ch < JOINT_COUNT; ++ch) {
+        if (!enabled[ch]) {
+            Serial.println("H requires every configured joint enabled at a known clear position.");
+            return;
+        }
+        current.servo[ch] = commanded[ch];
+    }
+    if (!validatePose(current)) return;
+    Serial.printf("Estimated HOME move: %lu ms. Verify clearance along the entire path.\n",
+                  (unsigned long)coordinatedDuration(current, home));
+}
+
+bool moveArmSmooth(const ArmPose &target)
+{
+    if (!ready || waving || poseMoving) {
+        Serial.println("Pose blocked: driver unavailable or another motion is active.");
+        return false;
+    }
+    if (!validatePose(target)) return false;
+    ArmPose current = {};
+    bool changed = false;
+    for (int ch = 0; ch < JOINT_COUNT; ++ch) {
+        if (!enabled[ch]) {
+            Serial.printf("Pose blocked: CH%d disabled; establish its starting position first.\n", ch);
+            return false;
+        }
+        current.servo[ch] = commanded[ch];
+        changed = changed || current.servo[ch] != target.servo[ch];
+    }
+    if (!validatePose(current)) return false;
+    if (!changed) {
+        Serial.println("Already at target commands; physical position is not measured.");
+        return true;
+    }
+    // No output changes until every joint and both endpoints have passed validation.
+    poseStart = current;
+    poseTarget = target;
+    poseDuration = coordinatedDuration(current, target);
+    poseStarted = poseLastFrame = millis();
+    poseMoving = true;
+    Serial.printf("Coordinated move started (%lu ms). stop=hold, !=disable all.\n",
+                  (unsigned long)poseDuration);
+    return true;
+}
+
+bool goHome()
+{
+    return moveArmSmooth(homePose());
+}
+
+void updateArmMotion()
+{
+    if (!poseMoving || !ready) return;
+    uint32_t now = millis();
+    if (now - poseLastFrame < 20) return;
+    poseLastFrame = now;
+    uint32_t elapsed = now - poseStarted;
+    float t = elapsed >= poseDuration ? 1.0f : float(elapsed) / poseDuration;
+    float eased = t * t * (3.0f - 2.0f * t);
+    for (int ch = 0; ch < JOINT_COUNT; ++ch) {
+        int next = elapsed >= poseDuration ? poseTarget.servo[ch] :
+                   int(poseStart.servo[ch] +
+                       (poseTarget.servo[ch] - poseStart.servo[ch]) * eased + 0.5f);
+        if (next != commanded[ch] && !writeJoint(ch, next)) return;
+    }
+    if (elapsed >= poseDuration) {
+        poseMoving = false;
+        Serial.println("Pose complete; joints hold their target commands.");
+    }
+}
+uint32_t waveDuration(int from, int to)
+{
+    uint32_t distance = from > to ? from - to : to - from;
+    uint32_t duration = (distance * 1000UL + WAVE_US_PER_SECOND - 1) / WAVE_US_PER_SECOND;
+    return duration < WAVE_MIN_LEG_MS ? WAVE_MIN_LEG_MS : duration;
+}
+
 // Validate ALL endpoints before making any movement; never silently clip a wave.
 bool prepareWave()
 {
     if (!ready) { Serial.println("Driver not ready."); return false; }
-    for (int i = 0; i < 4; ++i) {
+    uint32_t totalMs = 0;
+    for (int i = 0; i < WAVE_JOINT_COUNT; ++i) {
         int ch = WAVE_CHANNELS[i];
         if (!enabled[ch]) {
             Serial.printf("Wave blocked: CH%d (%s) must be enabled at a known clear position.\n", ch, JOINT_NAMES[ch]);
             return false;
         }
-        int origin = commanded[ch], outer = origin + WAVE_OFFSET_US[i];
-        int low = max(explorationMin(ch), joints[ch].low);
-        int high = min(explorationMax(ch), joints[ch].high);
-        if (origin < low || origin > high || outer < low || outer > high) {
-            Serial.printf("Wave blocked: CH%d targets %d/%d outside %d..%d us.\n", ch, origin, outer, low, high);
+        const Calibration &c = joints[ch];
+        int low = max(explorationMin(ch), c.low);
+        int high = min(explorationMax(ch), c.high);
+        if (!c.low || !c.home || !c.high || c.low >= c.high ||
+            c.low < low || c.high > high || c.home < low || c.home > high ||
+            commanded[ch] < low || commanded[ch] > high) {
+            Serial.printf("Wave blocked: CH%d needs valid min/home/max and a starting command inside %d..%d us.\n", ch, low, high);
             return false;
         }
-        waveOrigin[i] = origin; waveOuter[i] = outer;
+        waveTargets[i][0] = commanded[ch];
+        waveTargets[i][1] = c.home;
+        waveTargets[i][2] = c.low;
+        waveTargets[i][3] = c.high;
+        waveTargets[i][4] = c.home;
+        for (int pass = 0; pass < WAVE_PASSES; ++pass) {
+            for (int leg = 0; leg < WAVE_LEGS_PER_JOINT; ++leg) {
+                int from = pass > 0 && leg == 0 ? c.home : waveTargets[i][leg];
+                totalMs += waveDuration(from, waveTargets[i][leg + 1]);
+            }
+        }
     }
-    for (int i = 0; i < 4; ++i)
-        Serial.printf("CH%d %s: %d -> %d -> %d us\n", WAVE_CHANNELS[i], JOINT_NAMES[WAVE_CHANNELS[i]], waveOrigin[i], waveOuter[i], waveOrigin[i]);
-    Serial.println("Two passes, about 32 seconds. Limits checked; physical collisions are NOT detected.");
+    for (int i = 0; i < WAVE_JOINT_COUNT; ++i)
+        Serial.printf("CH%d %s: current %d -> home %d -> min %d -> max %d -> home %d us\n",
+                      WAVE_CHANNELS[i], JOINT_NAMES[WAVE_CHANNELS[i]],
+                      waveTargets[i][0], waveTargets[i][1], waveTargets[i][2],
+                      waveTargets[i][3], waveTargets[i][4]);
+    Serial.printf("%d passes, about %lu seconds. Full configured travel; physical collisions are NOT detected.\n",
+                  WAVE_PASSES, (unsigned long)((totalMs + 999) / 1000));
     return true;
 }
 void updateWave()
@@ -213,22 +377,25 @@ void updateWave()
     uint32_t now = millis();
     if (now - waveLastFrame < 20) return;
     waveLastFrame = now;
-    int i = (waveLeg / 2) % 4;
-    bool returning = (waveLeg % 2) != 0;
-    int from = returning ? waveOuter[i] : waveOrigin[i];
-    int to = returning ? waveOrigin[i] : waveOuter[i];
+    int legsPerPass = WAVE_JOINT_COUNT * WAVE_LEGS_PER_JOINT;
+    int pass = waveLeg / legsPerPass;
+    int i = (waveLeg / WAVE_LEGS_PER_JOINT) % WAVE_JOINT_COUNT;
+    int leg = waveLeg % WAVE_LEGS_PER_JOINT;
+    int from = pass > 0 && leg == 0 ? waveTargets[i][4] : waveTargets[i][leg];
+    int to = waveTargets[i][leg + 1];
+    uint32_t duration = waveDuration(from, to);
     uint32_t elapsed = now - waveLegStarted;
-    float t = elapsed >= WAVE_LEG_MS ? 1.0f : float(elapsed) / WAVE_LEG_MS;
+    float t = elapsed >= duration ? 1.0f : float(elapsed) / duration;
     float eased = t * t * (3.0f - 2.0f * t); // Smooth start/end without overshoot.
     int next = int(from + (to - from) * eased + 0.5f);
     int ch = WAVE_CHANNELS[i];
     if (next != commanded[ch] && !writeJoint(ch, next)) return;
-    if (elapsed >= WAVE_LEG_MS) {
+    if (elapsed >= duration) {
         ++waveLeg;
         waveLegStarted = millis(); // Late frames never skip an entire leg.
-        if (waveLeg >= 8 * WAVE_PASSES) {
+        if (waveLeg >= legsPerPass * WAVE_PASSES) {
             waving = false;
-            Serial.println("Wave complete; CH1..4 returned to their starting commands and keep holding.");
+            Serial.println("Wave complete; CH1..4 are at their home commands and keep holding.");
         }
     }
 }
@@ -251,16 +418,19 @@ void command(char *text)
         }
     }
     if (!strcmp(name, "?")) { help(); return; }
-    if (!strcmp(name, "stop")) { waving = false; Serial.println("Wave stopped; enabled joints hold their last commanded positions."); return; }
+    if (!strcmp(name, "stop")) { waving = false; poseMoving = false; Serial.println("Motion stopped; enabled joints hold their last commanded positions."); return; }
     if (!strcmp(name, "offall")) { disableAll(); return; }
     if (!strcmp(name, "list")) { printTable(); return; }
     if (!strcmp(name, "diag")) { diagnostics(); return; }
+    if (!strcmp(name, "pose")) { printPose(); return; }
+    if (!strcmp(name, "homeplan")) { previewHome(); return; }
     if (!ready) { Serial.println("PCA9685 unavailable. Check wiring and reset."); return; }
     // Keep stop/disable, status and channel selection responsive while moving.
     // Block edits and jogs so they cannot invalidate the captured start positions.
-    if (waving && strcmp(name, "ch") && strcmp(name, "x")) {
-        Serial.println("Wave is running. Send stop before another motion or calibration edit."); return;
+    if ((waving || poseMoving) && strcmp(name, "ch") && strcmp(name, "x")) {
+        Serial.println("Motion is running. Send stop before another motion or calibration edit."); return;
     }
+    if (!strcmp(name, "H")) { goHome(); return; }
     if (!strcmp(name, "wave") || !strcmp(name, "waveplan")) {
         if (!prepareWave()) return;
         if (!strcmp(name, "wave")) {
@@ -286,11 +456,12 @@ void command(char *text)
     bool &armed = enabled[channel];
     if (!strcmp(name, "x")) {
         waving = false;
+        poseMoving = false;
         if (pwm.setPWM(channel, 0, 4096) != 0) { reportOutputFault(); return; }
         armed = false;
     } else if (!strcmp(name, "ch")) {
         // Selecting another joint never disables or moves any output.
-        if (value >= JOINT_COUNT) { Serial.println("Channel must be 0..5."); return; }
+        if (value >= JOINT_COUNT) { Serial.println("Channel must be 0..4."); return; }
         channel = value;
     } else if (!strcmp(name, "arm")) {
         if (armed) { Serial.println("Already armed. Use + or - for small steps."); return; }
@@ -333,7 +504,7 @@ void setup()
 {
     Serial.begin(115200); delay(500);
     Wire.begin(SDA_PIN, SCL_PIN); Wire.setClock(100000); Wire.setTimeOut(50);
-    Serial.println("\nSix-joint arm control | PCA9685 0x41");
+    Serial.println("\nFive-joint arm control | PCA9685 0x41");
     ready = pwm.begin();
     if (!ready) { Serial.println("PCA9685 not found at 0x41."); return; }
     pwm.setPWMFreq(50); delay(10);
@@ -342,37 +513,43 @@ void setup()
         if (pwm.setPWM(i, 0, 4096) != 0) { reportOutputFault(); return; }
     }
     // New namespace keeps the old servo-cal values untouched. First boot uses the
-    // six rows supplied by the user; later save commands persist here instead.
+    // five rows supplied by the user; later save commands persist here instead.
     for (int i = 0; i < JOINT_COUNT; ++i) joints[i] = DEFAULTS[i];
     storageReady = prefs.begin("arm-v2", false);
-    // One-time CH0 correction: saved calibration overrides DEFAULTS.
-    // Preserve home and allow later min/max + save edits to survive reboot.
-    if (storageReady && !prefs.getBool("c0limits-v1", false)) {
+    // User-confirmed CH0 MAX is CLOSED at 2600 us. OPEN is not yet confirmed.
+    // Apply this correction once, preserving MIN/HOME and later calibration saves.
+    if (storageReady && !prefs.getBool("c0max2600-v1", false)) {
+        int low = prefs.getInt("c0l", DEFAULTS[0].low);
         int home = prefs.getInt("c0h", DEFAULTS[0].home);
-        if (home < 1100 || home > 3000) {
+        if (low < explorationMin(0) || low >= 2600 || home < low || home > 2600) {
             ready = false;
-            Serial.println("CH0 saved home outside 1100..3000; outputs remain disabled.");
+            Serial.println("CH0 saved MIN/HOME incompatible with MAX 2600; outputs remain disabled.");
             return;
         }
-        if (prefs.putInt("c0l", 1100) != sizeof(int) ||
-            prefs.putInt("c0u", 3000) != sizeof(int) ||
-            prefs.putBool("c0limits-v1", true) != sizeof(bool)) {
+        if (prefs.putInt("c0u", 2600) != sizeof(int) ||
+            prefs.putBool("c0max2600-v1", true) != sizeof(bool)) {
             ready = false;
-            Serial.println("Could not save CH0 limits; outputs remain disabled.");
+            Serial.println("Could not save CH0 MAX correction; outputs remain disabled.");
             return;
         }
-        Serial.println("CH0 limits corrected: min=1100 max=3000 us; home preserved.");
+        Serial.println("CH0 MAX corrected to 2600 us (CLOSED); MIN/HOME preserved.");
     }
-    // One-time CH5 trial minimum change. Keep its saved home/max and all other
-    // channels intact. Future min+save changes survive reboot (not forced to 800).
-    if (storageReady && !prefs.getBool("c5min500-v1", false)) {
-        if (prefs.putInt("c5l", 500) != sizeof(int) ||
-            prefs.putBool("c5min500-v1", true) != sizeof(bool)) {
+    // User-requested CH4 MIN update; preserve saved HOME/MAX and later saves.
+    if (storageReady && !prefs.getBool("c4min350-v1", false)) {
+        int home = prefs.getInt("c4h", DEFAULTS[4].home);
+        int high = prefs.getInt("c4u", DEFAULTS[4].high);
+        if (high <= 350 || high > explorationMax(4) || home < 350 || home > high) {
             ready = false;
-            Serial.println("Could not save CH5 trial minimum; outputs remain disabled.");
+            Serial.println("CH4 saved HOME/MAX incompatible with MIN 350; outputs remain disabled.");
             return;
         }
-        Serial.println("CH5 trial minimum changed to 700 us; home/max preserved.");
+        if (prefs.putInt("c4l", 350) != sizeof(int) ||
+            prefs.putBool("c4min350-v1", true) != sizeof(bool)) {
+            ready = false;
+            Serial.println("Could not save CH4 MIN update; outputs remain disabled.");
+            return;
+        }
+        Serial.println("CH4 MIN updated to 350 us; HOME/MAX preserved.");
     }
     if (storageReady) for (int i = 0; i < JOINT_COUNT; ++i) {
         char key[12];
@@ -389,7 +566,6 @@ void setup()
     if (!storageReady) Serial.println("Flash unavailable: using supplied defaults; save unavailable.");
     for (int i = 0; i < JOINT_COUNT; ++i) Serial.printf("CH%d = %s\n", i, JOINT_NAMES[i]);
     Serial.println("All outputs disabled. Support the arm before enabling or disabling a joint.");
-    Serial.println("CH5 only: exploration floor 800 us (trial, not a verified endpoint).");
     help(); status();
 }
 
@@ -411,5 +587,6 @@ void loop()
         }
     }
     updateWave();
+    updateArmMotion();
     delay(1); // Keep serial commands responsive.
 }

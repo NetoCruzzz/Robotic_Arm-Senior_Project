@@ -1,18 +1,17 @@
-# Six-joint arm controller
+# Five-joint arm controller
 
 ESP32 GPIO21 SDA / GPIO22 SCL; PCA9685 address 0x41, 50 Hz.
 Use the existing PlatformIO environment and Adafruit driver library.
 
 | Channel | Name | Min us | Home us | Max us |
 |---|---|---:|---:|---:|
-|0|Claw|1000|1800|2600|
+|0|Claw|1100|1800|2600|
 |1|Wrist Rot|1000|1800|2600|
 |2|Wrist|1000|1750|2500|
 |3|Elbow|1000|1800|2600|
-|4|Shoulder|1000|1800|2600|
-|5|Base|1000|1800|2600|
+|4|Shoulder|350|1800|2450|
 
-These are the user's tested values. Joint limits do not prevent all self-collisions.
+These are the configured defaults; saved calibration may override them. Joint limits do not prevent all self-collisions.
 Do not run a combined trajectory until its entire path is clear.
 
 ## Startup
@@ -31,7 +30,7 @@ again before restoring power. Stored command values are not feedback.
 
 ## Commands (115200 baud, Enter after each line)
 
-- `ch 0` through `ch 5`: select a joint without disabling the others.
+- `ch 0` through `ch 4`: select a joint without disabling the others.
 - `arm 1800`: enable selected joint at a known clear pulse, only if disabled.
 - `+` / `-`: jog selected enabled joint by 5 us.
 
@@ -44,7 +43,7 @@ again before restoring power. Stored command values are not feedback.
   prevent disabling; the supply output switch remains the physical power cutoff.
 - `min`, `max`, `markhome`: record current selected pulse; no movement.
 - `home`: legacy alias for markhome, NOT a motion command. Use armhome only from a supported home pose with all outputs disabled.
-- `save`: persist selected joint settings; `list`: print the six settings.
+- `save`: persist selected joint settings; `list`: print the five settings.
 - `diag`: register readback; `?`: command help.
 
 A write/readback fault blocks further movement and reports uncertainty;
@@ -52,7 +51,7 @@ other joints may still hold their last PWM. Remove power with the mechanism supp
 
 ## Settings and persistence
 
-Edit DEFAULTS for the six fallback values. A fresh `arm-v2` Preferences namespace
+Edit DEFAULTS for the five fallback values. A fresh `arm-v2` Preferences namespace
 uses this table, then saved arm-v2 calibration takes precedence on later boots.
 The old `servo-cal` namespace is untouched, including the old calibration.
 Changing DEFAULTS does not override already-saved arm-v2 settings.
